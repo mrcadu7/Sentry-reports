@@ -2,6 +2,7 @@ import requests
 from datetime import datetime, timedelta
 import pandas as pd
 import os
+import time
 from dotenv import load_dotenv
 from config import SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, SENTRY_URL, DEFAULT_REPORT_PATH
 
@@ -14,6 +15,10 @@ class SentryClient:
             'Content-Type': 'application/json'
         }
         self.base_url = SENTRY_URL
+        self.last_summary_request = datetime.now()
+        self.summary_requests_count = 0
+        self.summary_rate_limit = 10  # máximo de requisições
+        self.summary_rate_window = 60  # janela de tempo em segundos
 
     def get_organization_info(self):
         """Get information about the current organization"""
@@ -68,9 +73,32 @@ class SentryClient:
         
         return issues
 
+    def _check_rate_limit(self):
+        """
+        Verifica e controla o rate limit das requisições de sumário.
+        Espera se necessário para respeitar o limite de requisições.
+        """
+        current_time = datetime.now()
+        time_diff = (current_time - self.last_summary_request).total_seconds()
+        
+        # Se passou a janela de tempo, reseta o contador
+        if time_diff >= self.summary_rate_window:
+            self.summary_requests_count = 0
+            self.last_summary_request = current_time
+        
+        # Se atingiu o limite, espera até poder fazer nova requisição
+        if self.summary_requests_count >= self.summary_rate_limit:
+            wait_time = self.summary_rate_window - time_diff
+            if wait_time > 0:
+                print(f"\nAguardando {wait_time:.1f} segundos para respeitar o rate limit...")
+                time.sleep(wait_time)
+                self.summary_requests_count = 0
+                self.last_summary_request = datetime.now()
+
     def get_issue_summary(self, issue_id):
         """
         Get the AI summary analysis for a specific issue using POST request.
+        Implements rate limiting to handle the API restrictions.
         
         Args:
             issue_id (str): The ID of the issue
@@ -78,10 +106,22 @@ class SentryClient:
         Returns:
             tuple: (whats_wrong, possible_cause) strings from the summary analysis
         """
+        self._check_rate_limit()
+        
         endpoint = f'{self.base_url}/organizations/{SENTRY_ORG}/issues/{issue_id}/summarize/'
         
         try:
             response = requests.post(endpoint, headers=self.headers)
+            self.summary_requests_count += 1
+            
+            if response.status_code == 429:
+                print(f"\nRate limit atingido. Aguardando...")
+                time.sleep(self.summary_rate_window)
+                self.summary_requests_count = 0
+                self.last_summary_request = datetime.now()
+                # Tenta novamente após esperar
+                return self.get_issue_summary(issue_id)
+            
             if response.status_code == 200:
                 summary = response.json()
                 whats_wrong = summary.get('whatsWrong')
@@ -105,6 +145,7 @@ class SentryClient:
     def create_issues_dataframe(self, issues):
         """
         Convert a list of issues into a DataFrame.
+        Process issues in batches to respect rate limiting.
 
         Args:
             issues (list): List of issues from the Sentry API.
@@ -116,25 +157,36 @@ class SentryClient:
             return pd.DataFrame()
         
         report_data = []
-        for issue in issues:
-            # Obtém a análise do sumário para cada issue
-            whats_wrong, possible_cause = self.get_issue_summary(issue.get('id'))
+        batch_size = self.summary_rate_limit
+        
+        for i in range(0, len(issues), batch_size):
+            batch = issues[i:i + batch_size]
+            print(f"\nProcessando lote de {len(batch)} issues ({i+1} até {min(i+batch_size, len(issues))} de {len(issues)})")
             
-            report_data.append({
-                'title': issue.get('title'),
-                'count': issue.get('count', 0),
-                'users_affected': issue.get('userCount', 0),
-                'environment': issue.get('environment', 'all'),
-                'status': issue.get('status', 'unknown'),
-                'level': issue.get('level', 'unknown'),
-                'first_seen': issue.get('firstSeen'),
-                'last_seen': issue.get('lastSeen'),
-                'short_id': issue.get('shortId', ''),
-                'culprit': issue.get('culprit', ''),
-                'permalink': issue.get('permalink'),
-                'o_que_aconteceu': whats_wrong,
-                'possivel_causa': possible_cause
-            })
+            for issue in batch:
+                # Obtém a análise do sumário para cada issue
+                whats_wrong, possible_cause = self.get_issue_summary(issue.get('id'))
+                
+                report_data.append({
+                    'title': issue.get('title'),
+                    'count': issue.get('count', 0),
+                    'users_affected': issue.get('userCount', 0),
+                    'environment': issue.get('environment', 'all'),
+                    'status': issue.get('status', 'unknown'),
+                    'level': issue.get('level', 'unknown'),
+                    'first_seen': issue.get('firstSeen'),
+                    'last_seen': issue.get('lastSeen'),
+                    'short_id': issue.get('shortId', ''),
+                    'culprit': issue.get('culprit', ''),
+                    'permalink': issue.get('permalink'),
+                    'o_que_aconteceu': whats_wrong,
+                    'possivel_causa': possible_cause
+                })
+            
+            # Se ainda há mais issues para processar, dá uma pequena pausa entre os lotes
+            if i + batch_size < len(issues):
+                print("Pausa entre lotes...")
+                time.sleep(1)  # pequena pausa entre lotes para garantir
         
         df = pd.DataFrame(report_data)
         
