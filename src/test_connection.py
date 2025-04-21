@@ -3,8 +3,8 @@ from sentry_client import SentryClient, DEFAULT_REPORT_PATH
 def test_sentry_connection():
     """
     Test the Sentry API connection and generate a multi-sheet report.
-    Verifies the connection to Sentry and generates a report with different
-    categories of issues based on their priority and type.
+    Verifies the connection to Sentry and generates a report with different sheets
+    containing issues categorized by priority and type.
 
     Returns:
         bool: True if connection and report generation were successful, False otherwise.

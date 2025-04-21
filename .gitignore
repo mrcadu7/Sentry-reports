@@ -161,3 +161,4 @@ cython_debug/
 
 # Arquivos gerados
 *.xlsx
+issue_summaries_cache.json

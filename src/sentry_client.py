@@ -5,33 +5,103 @@ import os
 import time
 from dotenv import load_dotenv
 from config import SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, SENTRY_URL, DEFAULT_REPORT_PATH
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import json
+from pathlib import Path
 
 load_dotenv()
 
 class SentryClient:
+    NOT_AVAILABLE = "Não disponível"
+    CACHE_FILE = "issue_summaries_cache.json"
+    CACHE_EXPIRY = 3600  # 1 hora em segundos
+    MAX_RETRIES = 3
+    
     def __init__(self):
-        self.headers = {
+        self.session = requests.Session()
+        self.session.headers.update({
             'Authorization': f'Bearer {SENTRY_AUTH_TOKEN}',
             'Content-Type': 'application/json'
-        }
+        })
         self.base_url = SENTRY_URL
         self.last_summary_request = datetime.now()
         self.summary_requests_count = 0
-        self.summary_rate_limit = 10  # máximo de requisições
-        self.summary_rate_window = 60  # janela de tempo em segundos
+        self.summary_rate_limit = 10
+        self.summary_rate_window = 60
+        self._priority_cache = {}
+        self._rate_limit_lock = threading.Lock()
+        self._summary_cache = self._load_summary_cache()
+        
+        # Pré-carrega as prioridades
+        self._get_all_issues_with_priorities()
+        
+    def _load_summary_cache(self):
+        """Load summaries cache from file"""
+        try:
+            cache_path = Path(self.CACHE_FILE)
+            if cache_path.exists():
+                with open(cache_path, 'r') as f:
+                    cache_data = json.load(f)
+                # Limpa entradas expiradas
+                now = time.time()
+                cache_data = {
+                    k: v for k, v in cache_data.items()
+                    if now - v.get('timestamp', 0) < self.CACHE_EXPIRY
+                }
+                return cache_data
+        except Exception as e:
+            print(f"Erro ao carregar cache: {e}")
+        return {}
+
+    def _save_summary_cache(self):
+        """Save summaries cache to file"""
+        try:
+            with open(self.CACHE_FILE, 'w') as f:
+                json.dump(self._summary_cache, f)
+        except Exception as e:
+            print(f"Erro ao salvar cache: {e}")
+
+    def _make_request(self, method, endpoint, retry_count=0, **kwargs):
+        """
+        Centralized method for making HTTP requests with exponential retry.
+        
+        Args:
+            method (str): HTTP method to use
+            endpoint (str): API endpoint to call
+            retry_count (int): Current retry attempt number
+            **kwargs: Additional arguments to pass to requests
+            
+        Returns:
+            Response: The HTTP response from the API
+            
+        Raises:
+            RequestException: If the request fails after all retries
+        """
+        try:
+            url = f'{self.base_url}{endpoint}'
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            if retry_count < self.MAX_RETRIES:
+                wait_time = (2 ** retry_count) * 1
+                print(f"Erro na requisição: {e}. Tentando novamente em {wait_time}s...")
+                time.sleep(wait_time)
+                return self._make_request(method, endpoint, retry_count + 1, **kwargs)
+            raise
 
     def get_organization_info(self):
         """Get information about the current organization"""
-        endpoint = f'{self.base_url}/organizations/{SENTRY_ORG}/'
-        response = requests.get(endpoint, headers=self.headers)
-        response.raise_for_status()
+        endpoint = f'/organizations/{SENTRY_ORG}/'
+        response = self._make_request('GET', endpoint)
         return response.json()
 
     def get_project_info(self):
         """Get information about the current project"""
-        endpoint = f'{self.base_url}/projects/{SENTRY_ORG}/{SENTRY_PROJECT}/'
-        response = requests.get(endpoint, headers=self.headers)
-        response.raise_for_status()
+        endpoint = f'/projects/{SENTRY_ORG}/{SENTRY_PROJECT}/'
+        response = self._make_request('GET', endpoint)
         return response.json()
 
     def get_issues(self, query_params=None):
@@ -44,61 +114,61 @@ class SentryClient:
         Returns:
             list: List of issues matching the query parameters.
         """
-        endpoint = f'{self.base_url}/organizations/{SENTRY_ORG}/issues/'
+        endpoint = f'/organizations/{SENTRY_ORG}/issues/'
         
         # Parâmetros base para todas as consultas
         params = {
             'project': int(SENTRY_PROJECT),
             'statsPeriod': '24h',
             'limit': 100,
-            'sort': 'freq'
+            'sort': 'freq',
+            'environment': 'production',  # Sempre filtra por produção
+            'expand': ['owners', 'inbox'],  # Expande informações importantes
+            'shortIdLookup': '1'
         }
         
         # Atualiza com parâmetros personalizados se fornecidos
         if query_params:
             params.update(query_params)
         
-        print(f"\nFazendo requisição para: {endpoint}")
-        print(f"Com parâmetros: {params}")
+        print("\nFazendo requisição para:", endpoint)
+        print("Com parâmetros:", params)
         
-        response = requests.get(endpoint, headers=self.headers, params=params)
-        
-        if response.status_code != 200:
-            print(f"Resposta da API: {response.text}")
-            response.raise_for_status()
-        
+        response = self._make_request('GET', endpoint, params=params)
         issues = response.json()
-        print(f"\nDetalhes da resposta:")
-        print(f"Total de issues retornadas: {len(issues)}")
+        
+        print("\nDetalhes da resposta")
+        print("Total de issues retornadas:", len(issues))
         
         return issues
 
     def _check_rate_limit(self):
         """
-        Verifica e controla o rate limit das requisições de sumário.
-        Espera se necessário para respeitar o limite de requisições.
+        Thread-safe rate limit check.
+        Handles the rate limiting logic with proper thread synchronization.
         """
-        current_time = datetime.now()
-        time_diff = (current_time - self.last_summary_request).total_seconds()
-        
-        # Se passou a janela de tempo, reseta o contador
-        if time_diff >= self.summary_rate_window:
-            self.summary_requests_count = 0
-            self.last_summary_request = current_time
-        
-        # Se atingiu o limite, espera até poder fazer nova requisição
-        if self.summary_requests_count >= self.summary_rate_limit:
-            wait_time = self.summary_rate_window - time_diff
-            if wait_time > 0:
-                print(f"\nAguardando {wait_time:.1f} segundos para respeitar o rate limit...")
-                time.sleep(wait_time)
+        with self._rate_limit_lock:
+            current_time = datetime.now()
+            time_diff = (current_time - self.last_summary_request).total_seconds()
+            
+            # Se passou a janela de tempo, reseta o contador
+            if time_diff >= self.summary_rate_window:
                 self.summary_requests_count = 0
-                self.last_summary_request = datetime.now()
+                self.last_summary_request = current_time
+            
+            # Se atingiu o limite, espera até poder fazer nova requisição
+            if self.summary_requests_count >= self.summary_rate_limit:
+                wait_time = self.summary_rate_window - time_diff
+                if wait_time > 0:
+                    print(f"\nAguardando {wait_time:.1f} segundos para respeitar o rate limit...")
+                    time.sleep(wait_time)
+                    self.summary_requests_count = 0
+                    self.last_summary_request = datetime.now()
 
     def get_issue_summary(self, issue_id):
         """
         Get the AI summary analysis for a specific issue using POST request.
-        Implements rate limiting to handle the API restrictions.
+        Now with caching support.
         
         Args:
             issue_id (str): The ID of the issue
@@ -106,16 +176,21 @@ class SentryClient:
         Returns:
             tuple: (whats_wrong, possible_cause) strings from the summary analysis
         """
+        # Verifica o cache primeiro
+        cache_entry = self._summary_cache.get(issue_id)
+        if cache_entry and (time.time() - cache_entry['timestamp'] < self.CACHE_EXPIRY):
+            return cache_entry['whats_wrong'], cache_entry['possible_cause']
+
         self._check_rate_limit()
         
-        endpoint = f'{self.base_url}/organizations/{SENTRY_ORG}/issues/{issue_id}/summarize/'
+        endpoint = f'/organizations/{SENTRY_ORG}/issues/{issue_id}/summarize/'
         
         try:
-            response = requests.post(endpoint, headers=self.headers)
+            response = self._make_request('POST', endpoint)
             self.summary_requests_count += 1
             
             if response.status_code == 429:
-                print(f"\nRate limit atingido. Aguardando...")
+                print("\nRate limit atingido. Aguardando.")
                 time.sleep(self.summary_rate_window)
                 self.summary_requests_count = 0
                 self.last_summary_request = datetime.now()
@@ -124,28 +199,51 @@ class SentryClient:
             
             if response.status_code == 200:
                 summary = response.json()
-                whats_wrong = summary.get('whatsWrong')
-                possible_cause = summary.get('possibleCause')
-            
-                # Só faz o replace se o valor existir
-                if whats_wrong:
-                    whats_wrong = whats_wrong.replace('*', '')
-                if possible_cause:
-                    possible_cause = possible_cause.replace('*', '')
-                    
-                return (
-                    whats_wrong or "Não disponível",
-                    possible_cause or "Não disponível"
-                )
+                whats_wrong = summary.get('whatsWrong', '').replace('*', '') or self.NOT_AVAILABLE
+                possible_cause = summary.get('possibleCause', '').replace('*', '') or self.NOT_AVAILABLE
+                
+                # Atualiza o cache
+                self._summary_cache[issue_id] = {
+                    'whats_wrong': whats_wrong,
+                    'possible_cause': possible_cause,
+                    'timestamp': time.time()
+                }
+                self._save_summary_cache()
+                
+                return whats_wrong, possible_cause
+                
         except Exception as e:
             print(f"Erro ao obter sumário para issue {issue_id}: {str(e)}")
         
-        return "Não disponível", "Não disponível"
+        return self.NOT_AVAILABLE, self.NOT_AVAILABLE
+
+    def _process_summary_batch(self, batch_ids):
+        """
+        Process a batch of summaries in parallel using thread pool.
+        
+        Args:
+            batch_ids (list): List of issue IDs to process
+            
+        Returns:
+            list: List of summary tuples (whats_wrong, possible_cause)
+        """
+        with ThreadPoolExecutor(max_workers=min(len(batch_ids), 5)) as executor:
+            future_to_id = {
+                executor.submit(self.get_issue_summary, id): id 
+                for id in batch_ids
+            }
+            
+            results = []
+            for future in as_completed(future_to_id):
+                results.append(future.result())
+            
+            return results
 
     def create_issues_dataframe(self, issues):
         """
         Convert a list of issues into a DataFrame.
         Process issues in batches to respect rate limiting.
+        Uses vectorized operations and parallel processing for better performance.
 
         Args:
             issues (list): List of issues from the Sentry API.
@@ -156,137 +254,98 @@ class SentryClient:
         if not issues:
             return pd.DataFrame()
         
-        report_data = []
+        # Primeiro, extraímos todos os dados básicos de uma vez
+        basic_data = [{
+            'title': issue.get('title'),
+            'count': issue.get('count', 0),
+            'users_affected': issue.get('userCount', 0),
+            'environment': issue.get('environment', 'all'),
+            'status': issue.get('status', 'unknown'),
+            'level': issue.get('level', 'unknown'),
+            'first_seen': issue.get('firstSeen'),
+            'last_seen': issue.get('lastSeen'),
+            'short_id': issue.get('shortId', ''),
+            'culprit': issue.get('culprit', ''),
+            'permalink': issue.get('permalink'),
+            'issue_id': issue.get('id')
+        } for issue in issues]
+        
+        # Criamos o DataFrame base
+        df = pd.DataFrame(basic_data)
+        
+        # Processamos os sumários em lotes com paralelismo
+        summaries = []
         batch_size = self.summary_rate_limit
         
-        for i in range(0, len(issues), batch_size):
-            batch = issues[i:i + batch_size]
-            print(f"\nProcessando lote de {len(batch)} issues ({i+1} até {min(i+batch_size, len(issues))} de {len(issues)})")
+        for i in range(0, len(df), batch_size):
+            batch_ids = df['issue_id'].iloc[i:i + batch_size].tolist()
+            print(f"\nProcessando sumários do lote {i+1} até {min(i+batch_size, len(df))} de {len(df)}")
             
-            for issue in batch:
-                # Obtém a análise do sumário para cada issue
-                whats_wrong, possible_cause = self.get_issue_summary(issue.get('id'))
-                
-                report_data.append({
-                    'title': issue.get('title'),
-                    'count': issue.get('count', 0),
-                    'users_affected': issue.get('userCount', 0),
-                    'environment': issue.get('environment', 'all'),
-                    'status': issue.get('status', 'unknown'),
-                    'level': issue.get('level', 'unknown'),
-                    'first_seen': issue.get('firstSeen'),
-                    'last_seen': issue.get('lastSeen'),
-                    'short_id': issue.get('shortId', ''),
-                    'culprit': issue.get('culprit', ''),
-                    'permalink': issue.get('permalink'),
-                    'o_que_aconteceu': whats_wrong,
-                    'possivel_causa': possible_cause
-                })
+            batch_summaries = self._process_summary_batch(batch_ids)
+            summaries.extend(batch_summaries)
             
-            # Se ainda há mais issues para processar, dá uma pequena pausa entre os lotes
-            if i + batch_size < len(issues):
+            if i + batch_size < len(df):
                 print("Pausa entre lotes...")
-                time.sleep(1)  # pequena pausa entre lotes para garantir
+                time.sleep(1)
         
-        df = pd.DataFrame(report_data)
+        # Convertemos os sumários para DataFrame
+        summary_df = pd.DataFrame(summaries, columns=['o_que_aconteceu', 'possivel_causa'])
         
-        # Adiciona timestamp de quando o relatório foi gerado
+        # Combinamos os DataFrames
+        df = pd.concat([df, summary_df], axis=1)
+        df = df.drop('issue_id', axis=1)  # Removemos a coluna temporária
+        
+        # Adiciona timestamp
         df.insert(0, 'report_date', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         
-        # Ordena por frequência (mais frequentes primeiro)
+        # Ordena por frequência usando vetorização
         if not df.empty:
             df = df.sort_values(['count', 'users_affected'], ascending=[False, False])
         
         return df
 
-    def get_initial_priority(self, issue_title):
+    def _filter_by_priority_level(self, df, priority_level):
         """
-        Get the initial priority for a specific issue.
-
+        Filter DataFrame by priority level using API values.
+        priority_level can be: 'low', 'medium', 'high' or 'medium_high'
+        
         Args:
-            issue_title (str): The title of the issue to search for.
-
+            df (DataFrame): The DataFrame to filter
+            priority_level (str): Priority level to filter by
+            
         Returns:
-            int: The initial priority value, defaults to 0 if not found.
+            DataFrame: Filtered DataFrame containing only issues with matching priority
         """
-        query_params = {
-            'query': f'title:"{issue_title}"',
-            'statsPeriod': '24h'
-        }
+        if df.empty:
+            return df
+            
+        titles = df['title'].unique()
+        priorities = {title: self._get_issue_priority(title) for title in titles}
+        priority_series = df['title'].map(priorities)
         
-        issues = self.get_issues(query_params)
-        if issues and len(issues) > 0:
-            metadata = issues[0].get('metadata', {})
-            return int(metadata.get('initial_priority', 0))
-        return 0
+        if priority_level == 'low':
+            return df[priority_series == 'low']
+        elif priority_level == 'medium':
+            return df[priority_series == 'medium']
+        elif priority_level == 'high':
+            return df[priority_series == 'high']
+        elif priority_level == 'medium_high':
+            return df[priority_series.isin(['medium', 'high'])]
+        return df
 
-    def generate_multi_sheet_report(self):
+    def _get_issue_priority(self, issue_title):
         """
-        Generate a report with multiple sheets:
-        1. Medium/High priority errors that are unresolved
-        2. All high priority unresolved issues (any type)
-        3. All low priority unresolved issues (any type)
-        4. Any issue that is not an error
-
+        Get priority directly from Sentry API
+        
+        Args:
+            issue_title (str): The title of the issue
+            
         Returns:
-            dict: Dictionary containing DataFrames for each report sheet.
+            str: Priority level ('low', 'medium', or 'high')
         """
-        # Aba 1: Erros não resolvidos com prioridade média e alta
-        high_med_errors_params = {
-            'query': 'is:unresolved level:error',
-            'statsPeriod': '24h'
-        }
-        high_med_errors = self.get_issues(high_med_errors_params)
-        high_med_errors_df = self.create_issues_dataframe(high_med_errors)
-        
-        # Filtra erros de média e alta prioridade
-        if not high_med_errors_df.empty:
-            high_med_errors_df = high_med_errors_df[
-                high_med_errors_df.apply(lambda x: self.get_initial_priority(x['title']) >= 25, axis=1)
-            ]
-        
-        # Aba 2: Todas as issues não resolvidas de alta prioridade
-        high_priority_params = {
-            'query': 'is:unresolved',
-            'statsPeriod': '24h'
-        }
-        high_priority_issues = self.get_issues(high_priority_params)
-        high_priority_df = self.create_issues_dataframe(high_priority_issues)
-        
-        # Filtra alta prioridade
-        if not high_priority_df.empty:
-            high_priority_df = high_priority_df[
-                high_priority_df.apply(lambda x: self.get_initial_priority(x['title']) >= 50, axis=1)
-            ]
-        
-        # Aba 3: Todas as issues não resolvidas de baixa prioridade
-        low_priority_params = {
-            'query': 'is:unresolved',
-            'statsPeriod': '24h'
-        }
-        low_priority_issues = self.get_issues(low_priority_params)
-        low_priority_df = self.create_issues_dataframe(low_priority_issues)
-        
-        # Filtra baixa prioridade
-        if not low_priority_df.empty:
-            low_priority_df = low_priority_df[
-                low_priority_df.apply(lambda x: self.get_initial_priority(x['title']) < 50, axis=1)
-            ]
-        
-        # Aba 4: Todas as issues que não são erros
-        non_errors_params = {
-            'query': '!level:error',
-            'statsPeriod': '24h'
-        }
-        non_errors = self.get_issues(non_errors_params)
-        non_errors_df = self.create_issues_dataframe(non_errors)
-        
-        return {
-            'Erros_Med_Alta': high_med_errors_df,
-            'Alta_Prioridade': high_priority_df,
-            'Baixa_Prioridade': low_priority_df,
-            'Nao_Erros': non_errors_df
-        }
+        if issue_title in self._priority_cache:
+            return self._priority_cache[issue_title]
+        return 'low'  # default se não encontrado
 
     def save_multi_sheet_report(self, dataframes, output_path=None):
         """
@@ -307,8 +366,8 @@ class SentryClient:
         if os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
-            except:
-                pass
+            except OSError as e:
+                print(f"Erro ao remover arquivo temporário: {e}")
         
         # Cria o arquivo Excel com múltiplas abas
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -345,3 +404,109 @@ class SentryClient:
                 print(f"{key}: {value}")
             return example_issue
         return None
+
+    def _get_all_issues_with_priorities(self):
+        """
+        Get all issues with their priorities in a single request to optimize API calls.
+        Updates the internal priority cache with values from the API.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            response = self._make_request('GET', f'/organizations/{SENTRY_ORG}/issues/', params={
+                'project': int(SENTRY_PROJECT),
+                'statsPeriod': '24h',
+                'limit': 100,
+                'sort': 'freq'
+            })
+            issues = response.json()
+            
+            # Cache all priorities at once
+            for issue in issues:
+                title = issue.get('title')
+                if title:
+                    # Pega a prioridade diretamente do campo priority
+                    priority = issue.get('priority', 'low').lower()
+                    self._priority_cache[title] = priority
+            
+            return True
+        except Exception as e:
+            print(f"Erro ao obter issues com prioridades: {str(e)}")
+            return False
+
+    def generate_multi_sheet_report(self):
+        """
+        Generate a report with multiple sheets using optimized filtering.
+        Follows exact criteria:
+        - Erros Med/Alto: unresolved + category:error + (medium or high priority)
+        - Alta Prioridade: unresolved + high priority (any category)
+        - Baixa Prioridade: unresolved + low priority (any category)
+        - Outros: unresolved + (medium or high priority) + not category:error
+        """
+        # Obtemos todas as issues de uma vez com os filtros base
+        base_query = 'is:unresolved'
+        
+        # 1. Erros médio/alto (unresolved + category:error + medium/high priority)
+        high_med_errors_params = {
+            'query': f'{base_query} issue.priority:[high,medium] issue.category:error'
+        }
+        high_med_errors = self.get_issues(high_med_errors_params)
+        high_med_errors_df = self.create_issues_dataframe(high_med_errors)
+        
+        # 2. Alta prioridade (unresolved + high priority)
+        high_priority_params = {
+            'query': f'{base_query} issue.priority:high'
+        }
+        high_priority_issues = self.get_issues(high_priority_params)
+        high_priority_df = self.create_issues_dataframe(high_priority_issues)
+        
+        # 3. Baixa prioridade (unresolved + low priority)
+        low_priority_params = {
+            'query': f'{base_query} issue.priority:low'
+        }
+        low_priority_issues = self.get_issues(low_priority_params)
+        low_priority_df = self.create_issues_dataframe(low_priority_issues)
+        
+        # 4. Outros (unresolved + medium/high priority + not error)
+        others_params = {
+            'query': f'{base_query} issue.priority:[high,medium] !issue.category:error'
+        }
+        other_issues = self.get_issues(others_params)
+        others_df = self.create_issues_dataframe(other_issues)
+        
+        # Debug das contagens
+        print("\nDetalhes dos filtros:")
+        print(f"Total de erros médios/altos: {len(high_med_errors_df)}")
+        print(f"Total alta prioridade: {len(high_priority_df)}")
+        print(f"Total baixa prioridade: {len(low_priority_df)}")
+        print(f"Total outros: {len(others_df)}")
+        
+        return {
+            'Erros_Med_Alta': high_med_errors_df,
+            'Alta_Prioridade': high_priority_df,
+            'Baixa_Prioridade': low_priority_df,
+            'Nao_Erros': others_df
+        }
+
+    @lru_cache(maxsize=128)
+    def get_initial_priority(self, issue_title):
+        """
+        Get the priority for a specific issue.
+        Now uses the direct priority value from Sentry API.
+
+        Args:
+            issue_title (str): The title of the issue to search for.
+
+        Returns:
+            str: The priority value ('low', 'medium', or 'high')
+        """
+        # Verifica primeiro no cache local
+        if issue_title in self._priority_cache:
+            return self._priority_cache[issue_title]
+        
+        # Se não está no cache, atualiza o cache com todas as issues
+        if self._get_all_issues_with_priorities():
+            return self._priority_cache.get(issue_title, 'low')
+        
+        return 'low'
