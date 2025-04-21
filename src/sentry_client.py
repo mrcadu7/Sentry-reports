@@ -68,6 +68,40 @@ class SentryClient:
         
         return issues
 
+    def get_issue_summary(self, issue_id):
+        """
+        Get the AI summary analysis for a specific issue using POST request.
+        
+        Args:
+            issue_id (str): The ID of the issue
+            
+        Returns:
+            tuple: (whats_wrong, possible_cause) strings from the summary analysis
+        """
+        endpoint = f'{self.base_url}/organizations/{SENTRY_ORG}/issues/{issue_id}/summarize/'
+        
+        try:
+            response = requests.post(endpoint, headers=self.headers)
+            if response.status_code == 200:
+                summary = response.json()
+                whats_wrong = summary.get('whatsWrong')
+                possible_cause = summary.get('possibleCause')
+            
+                # Só faz o replace se o valor existir
+                if whats_wrong:
+                    whats_wrong = whats_wrong.replace('*', '')
+                if possible_cause:
+                    possible_cause = possible_cause.replace('*', '')
+                    
+                return (
+                    whats_wrong or "Não disponível",
+                    possible_cause or "Não disponível"
+                )
+        except Exception as e:
+            print(f"Erro ao obter sumário para issue {issue_id}: {str(e)}")
+        
+        return "Não disponível", "Não disponível"
+
     def create_issues_dataframe(self, issues):
         """
         Convert a list of issues into a DataFrame.
@@ -83,6 +117,9 @@ class SentryClient:
         
         report_data = []
         for issue in issues:
+            # Obtém a análise do sumário para cada issue
+            whats_wrong, possible_cause = self.get_issue_summary(issue.get('id'))
+            
             report_data.append({
                 'title': issue.get('title'),
                 'count': issue.get('count', 0),
@@ -94,7 +131,9 @@ class SentryClient:
                 'last_seen': issue.get('lastSeen'),
                 'short_id': issue.get('shortId', ''),
                 'culprit': issue.get('culprit', ''),
-                'permalink': issue.get('permalink')
+                'permalink': issue.get('permalink'),
+                'o_que_aconteceu': whats_wrong,
+                'possivel_causa': possible_cause
             })
         
         df = pd.DataFrame(report_data)
@@ -224,11 +263,11 @@ class SentryClient:
             # Garante que todas as abas existam, mesmo que vazias
             for sheet_name, df in dataframes.items():
                 if df.empty:
-                    # Cria aba vazia com cabeçalhos
                     empty_df = pd.DataFrame(columns=[
                         'report_date', 'title', 'count', 'users_affected',
                         'environment', 'status', 'level', 'first_seen',
-                        'last_seen', 'short_id', 'culprit', 'permalink'
+                        'last_seen', 'short_id', 'culprit', 'permalink',
+                        'o_que_aconteceu', 'possivel_causa'
                     ])
                     empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
                     print(f"\nAba {sheet_name} criada vazia")
