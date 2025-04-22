@@ -5,3 +5,4 @@ pandas>=2.0.0
 python-dateutil>=2.8.2
 openpyxl>=3.1.2
 urllib3>=2.0.0  # Para melhor performance nas conexões HTTP
+together>=1.5.5  # Together AI API

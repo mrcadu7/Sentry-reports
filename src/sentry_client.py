@@ -4,7 +4,10 @@ import pandas as pd
 import os
 import time
 from dotenv import load_dotenv
-from config import SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, SENTRY_URL, DEFAULT_REPORT_PATH
+from config import (
+    SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, SENTRY_URL, 
+    DEFAULT_REPORT_PATH, TOGETHER_API_KEY
+)
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -33,6 +36,9 @@ class SentryClient:
         self._priority_cache = {}
         self._rate_limit_lock = threading.Lock()
         self._summary_cache = self._load_summary_cache()
+        self._translation_rate_limit = 50  # Requisições por minuto para Together AI
+        self._last_translation = datetime.now()
+        self._translation_count = 0
         
         # Pré-carrega as prioridades
         self._get_all_issues_with_priorities()
@@ -165,21 +171,140 @@ class SentryClient:
                     self.summary_requests_count = 0
                     self.last_summary_request = datetime.now()
 
+    def _check_translation_rate_limit(self):
+        """
+        Thread-safe rate limit check for translations.
+        Implements a rolling window rate limit for Together AI API.
+        """
+        with self._rate_limit_lock:
+            current_time = datetime.now()
+            time_diff = (current_time - self._last_translation).total_seconds()
+            
+            # Se passou 1 minuto, reseta o contador
+            if time_diff >= 60:
+                self._translation_count = 0
+                self._last_translation = current_time
+            
+            # Se atingiu o limite, espera até poder fazer nova requisição
+            if self._translation_count >= self._translation_rate_limit:
+                wait_time = 60 - time_diff
+                if wait_time > 0:
+                    print(f"\nAguardando {wait_time:.1f} segundos para respeitar o rate limit da API de tradução...")
+                    time.sleep(wait_time)
+                    self._translation_count = 0
+                    self._last_translation = datetime.now()
+
+    def _translate_with_ai(self, text):
+        """
+        Translate text from English to Portuguese using Together AI.
+        Preserves technical terms and provides natural Portuguese translations.
+        
+        Args:
+            text (str): Text to translate
+            
+        Returns:
+            str: Translated text
+        """
+        if not text or text == self.NOT_AVAILABLE:
+            return self.NOT_AVAILABLE
+            
+        try:
+            headers = {
+                "Authorization": f"Bearer {TOGETHER_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "prompt": f"""### System: You are a specialized technical translator for software error messages and stack traces.
+Your task is to translate from English to Brazilian Portuguese while following these strict rules:
+
+1. NEVER translate these technical elements:
+   - Error types and their hierarchy (e.g. Exception, TypeError, ValueError, KeyError)
+   - Process/worker names (e.g. ForkPoolWorker-1, CeleryWorker)
+   - System signals (e.g. SIGKILL, SIGTERM, SIGINT)
+   - Stack trace components and line numbers
+   - Variable names, parameters, and attributes
+   - Database error codes and states
+   - HTTP status codes and methods
+   - API endpoint paths and parameters
+   - Package and module names
+   - Class and function names
+   - File paths and extensions
+   - Environment names (e.g. production, staging)
+   - JSON keys and data structure terms
+   - Git commands and states
+   - Configuration keys
+   - Protocol names and versions
+   - Queue names and routing keys
+
+2. Structure preservation rules:
+   - Keep all numbers, dates, and metrics exactly as they appear
+   - Preserve all punctuation and formatting
+   - Maintain any indentation in stack traces
+   - Keep all brackets, parentheses and their contents unchanged
+   - Preserve all quotes and their content when they contain technical information
+
+3. Translation guidelines:
+   - Translate surrounding context into clear, professional Brazilian Portuguese
+   - Use standard technical terminology common in Brazilian software development
+   - Keep error descriptions concise and technically accurate
+   - Maintain the original message's severity level and technical meaning
+   - Use appropriate Portuguese technical jargon where it exists
+
+### User: Translate this technical message to Portuguese while keeping technical terms unchanged:
+{text}
+
+### Assistant:""",
+                "temperature": 0.3,
+                "top_p": 0.7,
+                "top_k": 50,
+                "max_tokens": 200,
+                "repetition_penalty": 1.1,
+                "stop": ["###", "User:", "Assistant:", "System:"]
+            }
+            
+            # Aumenta o timeout para 30 segundos
+            response = requests.post(
+                "https://api.together.xyz/inference",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if "choices" in result:
+                    return result["choices"][0]["text"].strip()
+                return text
+
+            if response.status_code == 429:
+                # Aumenta o tempo de espera para 10 segundos
+                print("\nRate limit atingido. Aguardando 10s...")
+                time.sleep(10)
+                return self._translate_with_ai(text)
+            
+            return text
+
+        except Exception as e:
+            print(f"Erro ao traduzir texto: {str(e)}")
+            return text
+
     def get_issue_summary(self, issue_id):
         """
         Get the AI summary analysis for a specific issue using POST request.
-        Now with caching support.
         
         Args:
             issue_id (str): The ID of the issue
             
         Returns:
-            tuple: (whats_wrong, possible_cause) strings from the summary analysis
+            tuple: (whats_wrong, possible_cause) strings from the summary analysis, translated to Portuguese
         """
         # Verifica o cache primeiro
         cache_entry = self._summary_cache.get(issue_id)
-        if cache_entry and (time.time() - cache_entry['timestamp'] < self.CACHE_EXPIRY):
-            return cache_entry['whats_wrong'], cache_entry['possible_cause']
+        if (cache_entry and 
+            (time.time() - cache_entry['timestamp'] < self.CACHE_EXPIRY)):
+            return cache_entry['whats_wrong'], cache_entry['possivel_causa']
 
         self._check_rate_limit()
         
@@ -202,10 +327,16 @@ class SentryClient:
                 whats_wrong = summary.get('whatsWrong', '').replace('*', '') or self.NOT_AVAILABLE
                 possible_cause = summary.get('possibleCause', '').replace('*', '') or self.NOT_AVAILABLE
                 
-                # Atualiza o cache
+                # Traduz os textos usando IA
+                if whats_wrong != self.NOT_AVAILABLE:
+                    whats_wrong = self._translate_with_ai(whats_wrong)
+                if possible_cause != self.NOT_AVAILABLE:
+                    possible_cause = self._translate_with_ai(possible_cause)
+                
+                # Atualiza o cache com os textos traduzidos
                 self._summary_cache[issue_id] = {
                     'whats_wrong': whats_wrong,
-                    'possible_cause': possible_cause,
+                    'possivel_causa': possible_cause,
                     'timestamp': time.time()
                 }
                 self._save_summary_cache()
@@ -254,55 +385,72 @@ class SentryClient:
         if not issues:
             return pd.DataFrame()
         
-        # Primeiro, extraímos todos os dados básicos de uma vez
-        basic_data = [{
-            'title': issue.get('title'),
-            'count': issue.get('count', 0),
-            'users_affected': issue.get('userCount', 0),
-            'environment': issue.get('environment', 'all'),
-            'status': issue.get('status', 'unknown'),
-            'level': issue.get('level', 'unknown'),
-            'first_seen': issue.get('firstSeen'),
-            'last_seen': issue.get('lastSeen'),
-            'short_id': issue.get('shortId', ''),
-            'culprit': issue.get('culprit', ''),
-            'permalink': issue.get('permalink'),
-            'issue_id': issue.get('id')
-        } for issue in issues]
+        data = []
         
-        # Criamos o DataFrame base
-        df = pd.DataFrame(basic_data)
-        
-        # Processamos os sumários em lotes com paralelismo
-        summaries = []
-        batch_size = self.summary_rate_limit
-        
-        for i in range(0, len(df), batch_size):
-            batch_ids = df['issue_id'].iloc[i:i + batch_size].tolist()
-            print(f"\nProcessando sumários do lote {i+1} até {min(i+batch_size, len(df))} de {len(df)}")
+        # Processamos os sumários em lotes menores para melhor controle
+        batch_size = 5  # Reduzido para melhor gerenciamento do rate limit
+        for i in range(0, len(issues), batch_size):
+            batch = issues[i:i + batch_size]
+            print(f"\nProcessando sumários do lote {i+1} até {min(i+batch_size, len(issues))} de {len(issues)}")
             
-            batch_summaries = self._process_summary_batch(batch_ids)
-            summaries.extend(batch_summaries)
+            # Processa cada issue do lote
+            for issue in batch:
+                issue_id = issue.get('id')
+                
+                # Obtém e traduz o sumário
+                what_happened, possible_cause = self.get_issue_summary(issue_id)
+                
+                # Força a tradução se não estiver em português
+                if what_happened != self.NOT_AVAILABLE and not self._is_portuguese(what_happened):
+                    what_happened = self._translate_with_ai(what_happened)
+                if possible_cause != self.NOT_AVAILABLE and not self._is_portuguese(possible_cause):
+                    possible_cause = self._translate_with_ai(possible_cause)
+                
+                # Cria dicionário com todos os dados da issue
+                issue_data = {
+                    'report_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'title': issue.get('title'),
+                    'count': issue.get('count', 0),
+                    'users_affected': issue.get('userCount', 0),
+                    'environment': issue.get('environment', 'all'),
+                    'status': issue.get('status', 'unknown'),
+                    'level': issue.get('level', 'unknown'),
+                    'first_seen': issue.get('firstSeen'),
+                    'last_seen': issue.get('lastSeen'),
+                    'short_id': issue.get('shortId', ''),
+                    'culprit': issue.get('culprit', ''),
+                    'permalink': issue.get('permalink'),
+                    'o_que_aconteceu': what_happened,
+                    'possivel_causa': possible_cause
+                }
+                data.append(issue_data)
             
-            if i + batch_size < len(df):
-                print("Pausa entre lotes...")
-                time.sleep(1)
+            if i + batch_size < len(issues):
+                print("\nPausa entre lotes para respeitar rate limits...")
+                time.sleep(2)
         
-        # Convertemos os sumários para DataFrame
-        summary_df = pd.DataFrame(summaries, columns=['o_que_aconteceu', 'possivel_causa'])
-        
-        # Combinamos os DataFrames
-        df = pd.concat([df, summary_df], axis=1)
-        df = df.drop('issue_id', axis=1)  # Removemos a coluna temporária
-        
-        # Adiciona timestamp
-        df.insert(0, 'report_date', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        # Criamos o DataFrame com todos os dados
+        df = pd.DataFrame(data)
         
         # Ordena por frequência usando vetorização
         if not df.empty:
             df = df.sort_values(['count', 'users_affected'], ascending=[False, False])
         
         return df
+
+    def _is_portuguese(self, text):
+        """
+        Verifica se o texto já está em português usando heurísticas simples.
+        """
+        if not text:
+            return False
+            
+        # Palavras comuns em português que não existem em inglês
+        portuguese_words = {'erro', 'falha', 'durante', 'com', 'foi', 'está', 'não', 'na', 'da', 'do', 'em', 'para'}
+        words = set(text.lower().split())
+        
+        # Se encontrar pelo menos 2 palavras em português, considera que já está traduzido
+        return len(words.intersection(portuguese_words)) >= 2
 
     def _filter_by_priority_level(self, df, priority_level):
         """
